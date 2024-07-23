@@ -1,0 +1,97 @@
+from langchain_community.chat_models import ChatOllama
+from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+from langchain.chains import MapReduceDocumentsChain, ReduceDocumentsChain
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains.llm import LLMChain
+from langchain import hub
+import requests
+import fitz  # PyMuPDF
+from langchain.schema import Document
+from langchain.prompts import PromptTemplate
+import cx_Oracle
+from sqlalchemy import create_engine, text
+import multiprocessing
+import os
+
+def download_pdf(url, local_path):
+    response = requests.get(url)
+    with open(local_path, 'wb') as file:
+        file.write(response.content)
+    print(f"PDF가 {local_path}에 저장되었습니다.")
+    
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        text += page.get_text()
+    return text
+    
+def analyze_pdf(pdf_path):
+    # 1단계: 텍스트 내용 추출
+    text_content = extract_text_from_pdf(pdf_path)
+    print("텍스트 내용:")
+    print(text_content[:500])  # 추출한 텍스트의 처음 500자를 출력
+    return text_content
+    
+def summarize_document():
+    pdf_url = 'https://accesson.kr/kosim/assets/pdf/43327/JKOSIM-42-2-245_Rhee.pdf'
+    local_pdf_path = 'downloaded_file.pdf'
+    download_pdf(pdf_url, local_pdf_path)
+    text_content = analyze_pdf(local_pdf_path)
+    docs = [Document(page_content=text_content)]
+
+    llm = ChatOllama(model="llama3:latest", batch_size=2)
+    
+    map_prompt = hub.pull("teddynote/map-prompt")
+    map_prompt
+    map_chain = LLMChain(llm=llm, prompt=map_prompt)
+    
+    reduce_prompt = hub.pull("teddynote/reduce-prompt-korean")
+    
+    # 연쇄 실행
+    reduce_chain = LLMChain(llm=llm, prompt=reduce_prompt)
+    
+    # 문서 리스트를 받아 하나의 문자열로 결합한 후 LLMChain에 전달
+    combine_documents_chain = StuffDocumentsChain(
+        llm_chain=reduce_chain, document_variable_name="doc_summaries"
+    )
+    
+    # 매핑된 문서들을 결합하고 반복적으로 축소
+    reduce_documents_chain = ReduceDocumentsChain(
+        # 최종적으로 호출되는 체인입니다.
+        combine_documents_chain=combine_documents_chain,
+        # `StuffDocumentsChain`의 컨텍스트를 초과하는 문서들을 처리
+        collapse_documents_chain=combine_documents_chain,
+        # 문서들을 그룹화할 최대 토큰 수.
+        token_max=4096,
+    )
+    
+    # 문서들을 매핑하여 체인을 거친 후 결과를 결합하는 과정
+    map_reduce_chain = MapReduceDocumentsChain(
+        # 매핑 체인
+        llm_chain=map_chain,
+        # 리듀스 체인
+        reduce_documents_chain=reduce_documents_chain,
+        # llm_chain에서 문서들을 넣을 변수 이름
+        document_variable_name="docs",
+        # 매핑 단계의 결과를 출력에 포함시킴
+        return_intermediate_steps=False,
+    )
+    
+    # 문자를 기준으로 텍스트를 분할하는 객체 생성
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1024,
+        chunk_overlap=50,
+        separators=["\n\n", "\n", "(?<=\. )", " ", ""],
+        length_function=len,
+    )
+    
+    # 문서들을 분할
+    split_docs = text_splitter.split_documents(docs)
+    
+    summary_result = map_reduce_chain.invoke({"input_documents": split_docs})
+    return summary_result["output_text"]
+    
+summary = summarize_document()
+print(summary)
